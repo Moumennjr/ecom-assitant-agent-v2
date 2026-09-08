@@ -78,6 +78,7 @@ class ProductDiscoveryInput(BaseModel):
 class ProductDiscoveryContext(BaseModel):
     input: ProductDiscoveryInput = Field(default_factory=ProductDiscoveryInput)
     tool_results: list[Product] = Field(default_factory=list)
+    selected_product: Product | None = None
     retrieved_at: datetime | None = None
 
 
@@ -252,6 +253,22 @@ TOOLS = [
 tool_node = ToolNode(TOOLS)
 tool_model = model.bind_tools(TOOLS)
 
+TOOL_NAMES = tuple(t.name for t in TOOLS)
+TOOL_DESCRIPTIONS = {
+    "searchProducts": "Search the catalog for products matching a free-text query.",
+    "recallPreviousProducts": "Bring back products shown in an earlier product search.",
+    "selectProduct": "Select a specific product from the current search results.",
+    "getProductDetails": "Return full details for a product by its id.",
+    "suggestProducts": "Suggest products matching some criteria.",
+    "calculateShipping": "Estimate shipping cost for an order to a location.",
+    "getOrderStatus": "Check the status of an existing order.",
+    "createOrder": "Place an order for the product already selected in the active flow (set quantity).",
+    "confirmOrder": "Confirm a pending order.",
+    "modifyOrder": "Modify an existing order.",
+    "cancelOrder": "Cancel an existing order.",
+    "escalateConversation": "Only when the request truly cannot be handled by the other tools.",
+}
+
 
 # ============================================================
 # Structured output models
@@ -270,25 +287,12 @@ class AgentState(BaseModel):
 
 class CheckResult(BaseModel):
     needs_tool: bool = Field(default=False, description="Whether the query requires a tool")
-    tool_name: str | None = Field(default=None, description="Name of the tool to use if needed")
+    tool_name: Literal[*TOOL_NAMES] | None = Field(default=None, description="Name of the tool to use if needed")
     reply: str = Field(default="", description="Direct answer if no tool is needed")
 
 
 class ToolChoice(BaseModel):
-    tool: Literal[
-        "searchProducts",
-        "recallPreviousProducts",
-        "selectProduct",
-        "getProductDetails",
-        "suggestProducts",
-        "calculateShipping",
-        "getOrderStatus",
-        "createOrder",
-        "confirmOrder",
-        "modifyOrder",
-        "cancelOrder",
-        "escalateConversation",
-    ] = Field(description="The tool to use for the user's request")
+    tool: Literal[*TOOL_NAMES] = Field(description="The tool to use for the user's request")
     arguments: dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool")
 
 
@@ -336,10 +340,40 @@ def query_tool(state: AgentState) -> dict:
     if not call:
         return {"tool_outputs": ["No tools provided."]}
     user_text = last_user_text(state)
+    active = _active_flow(state.conversation_memory, state.resolved_flow_id)
+    flow_context = None
+    if active is not None:
+        selected = None
+        if active.product_discovery:
+            if active.product_discovery.selected_product is not None:
+                selected = active.product_discovery.selected_product.model_dump()
+            elif active.product_discovery.tool_results:
+                selected = active.product_discovery.tool_results[0].model_dump()
+        flow_context = {
+            "flow_id": active.flow_id,
+            "state": active.state.value if isinstance(active.state, FlowState) else active.state,
+            "selected_product": selected,
+        }
+    system = (
+        "You pick the single best tool for the user's request. Available tools:\n"
+        + "\n".join(f"- {name}: {desc}" for name, desc in TOOL_DESCRIPTIONS.items())
+        + "\nRules:\n"
+        "- When the user wants to BUY or ORDER a product that is already selected or visible in the "
+        "conversation, choose createOrder and set quantity accordingly.\n"
+        "- Never invent tools: if `requested_tool` is not in the list above, ignore it and remap the "
+        "request to the correct tool from the list.\n"
+        "- Only choose escalateConversation if no other tool fits."
+    )
     choice = tool_picker.invoke([
-        HumanMessage(content=json.dumps({"requested_tool": call.get("name"), "user_request": user_text}))
+        SystemMessage(content=system),
+        HumanMessage(content=json.dumps({
+            "requested_tool": call.get("name"),
+            "user_request": user_text,
+            "active_flow": flow_context,
+        }, ensure_ascii=False, default=str)),
     ])
     result = f"Selected tool: {choice.tool}. Args: {choice.arguments}"
+    logger.info("query_tool -> %s", result)
     return {"tool_outputs": [result]}
 
 
@@ -368,8 +402,12 @@ def flow_resolver(state: AgentState) -> dict:
         "- If there are no flows, or the user is starting a new product search, return CREATE.\n"
         "- If an active flow is compatible with the request, return CONTINUE with its flow_id.\n"
         "- If the request refers to another existing flow, return CONTINUE with that flow_id.\n"
-        "- If it is ambiguous which flow applies, return CLARIFY with a reason.\n"
-        "- If the action is not valid for any flow, return INVALID_ACTION with a reason."
+        "- A request to BUY or ORDER a product is a valid order action: if a flow already has the "
+        "product selected, return CONTINUE with its flow_id; otherwise return CREATE (an order flow). "
+        "Never return INVALID_ACTION for a buy/order request.\n"
+        "- escalateConversation applies only when the matter is truly out of scope; return "
+        "INVALID_ACTION with a reason.\n"
+        "- If it is ambiguous which flow applies, return CLARIFY with a reason."
     )
     result = flow_resolver_model.invoke([
         SystemMessage(content=system),
@@ -427,8 +465,11 @@ def _make_create_order_tool(flow: Flow | None):
     def createOrder(quantity: int) -> str:
         """Create an order for the product selected in the current flow."""
         product = None
-        if flow is not None and flow.product_discovery is not None and flow.product_discovery.tool_results:
-            product = flow.product_discovery.tool_results[0]
+        if flow is not None and flow.product_discovery is not None:
+            if flow.product_discovery.selected_product is not None:
+                product = flow.product_discovery.selected_product
+            elif flow.product_discovery.tool_results:
+                product = flow.product_discovery.tool_results[0]
         if product is None:
             return (
                 f"No product selected in flow {flow.flow_id if flow else 'none'} to order. "
@@ -487,14 +528,26 @@ def calling_tool(state: AgentState) -> dict:
     tool_messages = runtime_tool_node.invoke([ai_msg])
 
     called_name = ""
+    call_args: dict[str, Any] = {}
     if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
         called_name = ai_msg.tool_calls[0].get("name", "")
+        call_args = ai_msg.tool_calls[0].get("args") or {}
     if called_name in PRODUCT_RESULT_TOOLS and tool_messages:
         prods = _tool_result_products(getattr(tool_messages[0], "content", ""))
         if prods and flow is not None:
             if flow.product_discovery is None:
                 flow.product_discovery = ProductDiscoveryContext()
             flow.product_discovery.tool_results = prods
+            selected = prods[0]
+            if called_name == "selectProduct":
+                selector = str(call_args.get("selector") or "").strip()
+                selected = next(
+                    (p for p in prods if p.product_id == selector or p.product_name.lower() == selector.lower()),
+                    prods[0],
+                )
+            elif call_args.get("product_id"):
+                selected = next((p for p in prods if p.product_id == str(call_args.get("product_id"))), prods[0])
+            flow.product_discovery.selected_product = selected
 
     return {
         "messages": [ai_msg, *tool_messages],
