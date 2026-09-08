@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -117,13 +118,51 @@ class ConversationMemory(BaseModel):
 
 
 # ============================================================
-# Tools (stubs)
+# Tools
 # ============================================================
+
+PRODUCTS_PATH = os.path.join(os.path.dirname(__file__), "data", "products.json")
+_PRODUCTS_CACHE: list[dict[str, Any]] | None = None
+
+
+def load_products() -> list[dict[str, Any]]:
+    global _PRODUCTS_CACHE
+    if _PRODUCTS_CACHE is None:
+        try:
+            with open(PRODUCTS_PATH, encoding="utf-8") as f:
+                _PRODUCTS_CACHE = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Could not load products from %s: %s", PRODUCTS_PATH, e)
+            _PRODUCTS_CACHE = []
+    return _PRODUCTS_CACHE
+
+
+def _compact_product(p: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": p.get("id"),
+        "name": p.get("name"),
+        "price": p.get("price"),
+        "currency": p.get("currency"),
+        "category": p.get("category"),
+        "stockStatus": p.get("stockStatus"),
+    }
+
 
 @tool
 def searchProducts(query: str) -> str:
-    """Search the product catalog."""
-    return "searchProducts tool executed (stub)."
+    """Search the product catalog by name, description or category."""
+    q = query.strip().lower()
+    if not q:
+        return "No query provided."
+    hits = [
+        p for p in load_products()
+        if q in (p.get("name") or "").lower()
+        or q in (p.get("description") or "").lower()
+        or q in (p.get("category") or "").lower()
+    ]
+    if not hits:
+        return f"No products found for '{query}'."
+    return json.dumps([_compact_product(p) for p in hits[:5]], ensure_ascii=False)
 
 
 @tool
@@ -140,8 +179,11 @@ def selectProduct(selector: str) -> str:
 
 @tool
 def getProductDetails(product_id: str) -> str:
-    """Get details for a specific product."""
-    return "getProductDetails tool executed (stub)."
+    """Get the full details for a specific product by its id."""
+    for p in load_products():
+        if p.get("id") == product_id:
+            return json.dumps(p, ensure_ascii=False)
+    return f"Product not found for id '{product_id}'."
 
 
 @tool
@@ -395,7 +437,14 @@ def reply(state: AgentState) -> dict:
         tool_result = state.tool_outputs[-1] if state.tool_outputs else "No tool output available."
         user_text = last_user_text(state)
         response = model.invoke([
-            SystemMessage(content="You are a helpful e-commerce assistant. Answer the user's request based only on the tool result provided."),
+            SystemMessage(
+                content=(
+                    "You are a helpful e-commerce assistant. Answer the user's request based only on "
+                    "the tool result provided. When the result lists products, present them as a short "
+                    "bulleted list with name and price in the given currency, and note stock availability "
+                    "if relevant. If the result says no products were found, acknowledge that politely."
+                )
+            ),
             HumanMessage(content=f"Tool result:\n{tool_result}\n\nUser request: {user_text}"),
         ])
         text = response.content if hasattr(response, "content") else str(response)
@@ -430,6 +479,7 @@ graph.add_conditional_edges("flow_resolver", flow_route, {"calling_tool": "calli
 graph.add_edge("calling_tool", "reply")
 graph.add_edge("reply", END)
 app = graph.compile(checkpointer=InMemorySaver())
+
 
 
 def to_serializable(value: Any) -> Any:
@@ -476,6 +526,7 @@ if __name__ == "__main__":
             {"messages": [{"role": "user", "content": user_input}]},
             config=config,
         )
+        print("The graph state: ", result)
         state = result.model_dump() if hasattr(result, "model_dump") else result
         if isinstance(state["messages"][-1], str):
             reply_text = state["messages"][-1]
