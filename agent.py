@@ -415,18 +415,91 @@ def flow_resolver(state: AgentState) -> dict:
     return updates
 
 
+def _active_flow(mem: ConversationMemory, resolved_flow_id: str | None) -> Flow | None:
+    flow_id = resolved_flow_id or mem.active_flow_id
+    if not flow_id:
+        return None
+    return next((f for f in mem.flows if f.flow_id == flow_id), None)
+
+
+def _make_create_order_tool(flow: Flow | None):
+    @tool
+    def createOrder(quantity: int) -> str:
+        """Create an order for the product selected in the current flow."""
+        product = None
+        if flow is not None and flow.product_discovery is not None and flow.product_discovery.tool_results:
+            product = flow.product_discovery.tool_results[0]
+        if product is None:
+            return (
+                f"No product selected in flow {flow.flow_id if flow else 'none'} to order. "
+                "Run a product search first so the product is attached to the active flow."
+            )
+        return json.dumps({
+            "tool": "createOrder",
+            "product_id": product.product_id,
+            "product_name": product.product_name,
+            "price": product.price,
+            "quantity": quantity,
+            "status": "order_created",
+        }, ensure_ascii=False)
+    return createOrder
+
+
+def _tool_result_products(content: str) -> list[Product] | None:
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return None
+    products = []
+    for item in data:
+        pid = item.get("product_id") or item.get("id")
+        name = item.get("product_name") or item.get("name")
+        price = item.get("price")
+        if not pid or not name or price is None:
+            continue
+        products.append(Product(product_id=str(pid), product_name=str(name), price=float(price)))
+    return products or None
+
+
+PRODUCT_RESULT_TOOLS = {"searchProducts", "getProductDetails", "recallPreviousProducts", "selectProduct", "suggestProducts"}
+
+
 def calling_tool(state: AgentState) -> dict:
     user_text = last_user_text(state)
     tool_context = state.tool_outputs[-1] if state.tool_outputs else "No tool selected."
+    mem = state.conversation_memory.model_copy(deep=True)
+    flow = _active_flow(mem, state.resolved_flow_id)
+
+    order_tool = _make_create_order_tool(flow)
+    tools = [order_tool] + [t for t in TOOLS if t.name != "createOrder"]
+    runtime_tool_node = ToolNode(tools)
+    runtime_tool_model = model.bind_tools(tools)
+
     system = (
         "You are an e-commerce assistant. Call the requested tool to fulfill the user's request."
         f"\nResolved flow id: {state.resolved_flow_id or 'none'}. Tool context: {tool_context}"
     )
-    ai_msg = tool_model.invoke([SystemMessage(content=system), HumanMessage(content=user_text)])
-    tool_messages = tool_node.invoke([ai_msg])
+    ai_msg = runtime_tool_model.invoke([SystemMessage(content=system), HumanMessage(content=user_text)])
+    tool_messages = runtime_tool_node.invoke([ai_msg])
+
+    called_name = ""
+    if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
+        called_name = ai_msg.tool_calls[0].get("name", "")
+    if called_name in PRODUCT_RESULT_TOOLS and tool_messages:
+        prods = _tool_result_products(getattr(tool_messages[0], "content", ""))
+        if prods and flow is not None:
+            if flow.product_discovery is None:
+                flow.product_discovery = ProductDiscoveryContext()
+            flow.product_discovery.tool_results = prods
+
     return {
         "messages": [ai_msg, *tool_messages],
         "tool_outputs": [getattr(m, "content", str(m)) for m in tool_messages],
+        "conversation_memory": mem,
     }
 
 
