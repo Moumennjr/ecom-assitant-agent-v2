@@ -10,6 +10,9 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.prebuilt import ToolNode
+from langgraph.store.memory import InMemoryStore
+from langgraph.store.base import BaseStore
+from langchain_core.runnables import RunnableConfig
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import (
     AIMessage,
@@ -18,6 +21,7 @@ from langchain_core.messages import (
     ToolMessage,
     message_to_dict,
 )
+from rich import print
 from langchain_core.tools import tool
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -27,9 +31,12 @@ logger = logging.getLogger(__name__)
 logging.getLogger("google.genai").setLevel(logging.WARNING)
 
 load_dotenv()
+api_key = os.getenv("GOOGLE_API_KEY")
 
-model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-
+model = ChatGoogleGenerativeAI(
+    model="gemini-3.5-flash",
+    google_api_key=api_key,
+)
 
 def messages_reducer(left: list[Any], right: list[Any]) -> list[Any]:
     return [*left, *right]
@@ -578,6 +585,32 @@ def reply(state: AgentState) -> dict:
 
 
 # ============================================================
+# InMemoryStore persistence (long-term memory)
+# ============================================================
+
+def _store_config(config: RunnableConfig) -> tuple[tuple[str, str], str]:
+    cfg = (config or {}).get("configurable", {}) or {}
+    store_key = cfg.get("store_key") or cfg.get("thread_id") or "default"
+    return ("assistant", str(store_key)), str(store_key)
+
+
+def hydrate(state: AgentState, *, store: BaseStore, config: RunnableConfig) -> dict:
+    if state.conversation_memory.flows:
+        return {}
+    ns, _ = _store_config(config)
+    item = store.get(ns, "conversation_memory")
+    if item is None:
+        return {}
+    return {"conversation_memory": ConversationMemory(**item.value)}
+
+
+def persist(state: AgentState, *, store: BaseStore, config: RunnableConfig) -> dict:
+    ns, _ = _store_config(config)
+    store.put(ns, "conversation_memory", state.conversation_memory.model_dump(mode="json"))
+    return {}
+
+
+# ============================================================
 # Routing
 # ============================================================
 
@@ -592,19 +625,25 @@ def flow_route(state: AgentState) -> str:
 
 
 graph = StateGraph(AgentState)
+graph.add_node("hydrate", hydrate)
 graph.add_node("check_llm", check_llm)
 graph.add_node("query_tool", query_tool)
 graph.add_node("flow_resolver", flow_resolver)
 graph.add_node("calling_tool", calling_tool)
 graph.add_node("reply", reply)
+graph.add_node("persist", persist)
 
-graph.add_edge(START, "check_llm")
+graph.add_edge(START, "hydrate")
+graph.add_edge("hydrate", "check_llm")
 graph.add_conditional_edges("check_llm", route, {"query_tool": "query_tool", "reply": "reply"})
 graph.add_edge("query_tool", "flow_resolver")
 graph.add_conditional_edges("flow_resolver", flow_route, {"calling_tool": "calling_tool", "reply": "reply"})
 graph.add_edge("calling_tool", "reply")
-graph.add_edge("reply", END)
-app = graph.compile(checkpointer=InMemorySaver())
+graph.add_edge("reply", "persist")
+graph.add_edge("persist", END)
+
+store = InMemoryStore()
+app = graph.compile(checkpointer=InMemorySaver(), store=store)
 
 
 

@@ -5,15 +5,24 @@ config:
 ---
 graph TD;
 	__start__([<p>__start__</p>]):::first
+	hydrate(hydrate)
 	check_llm(check_llm)
 	query_tool(query_tool)
+	flow_resolver(flow_resolver)
+	calling_tool(calling_tool)
 	reply(reply)
+	persist(persist)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> check_llm;
+	__start__ --> hydrate;
+	calling_tool --> reply;
 	check_llm -.-> query_tool;
 	check_llm -.-> reply;
-	query_tool --> reply;
-	reply --> __end__;
+	flow_resolver -.-> calling_tool;
+	flow_resolver -.-> reply;
+	hydrate --> check_llm;
+	query_tool --> flow_resolver;
+	reply --> persist;
+	persist --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc
