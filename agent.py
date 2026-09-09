@@ -300,17 +300,20 @@ class AgentState(BaseModel):
     resolved_flow_id: str | None = None
     flow_direction: str = "normal"
     flow_action: str | None = None
+    escalation: bool = False
+    proposed_intent: str | None = None
 
 
 class CheckResult(BaseModel):
     needs_tool: bool = Field(default=False, description="Whether the query requires a tool")
-    tool_name: Literal[*TOOL_NAMES] | None = Field(default=None, description="Name of the tool to use if needed")
+    tool_name: str | None = Field(default=None, description="Name of the tool (or proposed intent name) to use if needed")
     reply: str = Field(default="", description="Direct answer if no tool is needed")
 
 
 class ToolChoice(BaseModel):
-    tool: Literal[*TOOL_NAMES] = Field(description="The tool to use for the user's request")
+    tool: Literal[*TOOL_NAMES] | None = Field(default=None, description="The tool to use for the user's request")
     arguments: dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool")
+    proposed_new_tool: str | None = Field(default=None, description="Name of a missing intent/tool the request needs when NONE of the available tools fits")
 
 
 class AddressFields(BaseModel):
@@ -812,7 +815,18 @@ def after_extract(state: AgentState) -> str:
 
 
 def check_llm(state: AgentState) -> dict:
-    messages = [SystemMessage(content=struct_schema_hint(CheckResult)), *state.messages]
+    system = (
+        "You are the intent classifier of an e-commerce assistant. Available intents:\n"
+        + "\n".join(f"- {name}: {desc}" for name, desc in TOOL_DESCRIPTIONS.items())
+        + "\nDecide whether the customer's latest message needs a tool-backed action or can be answered "
+        "directly:\n"
+        "- Plain conversation or lightweight questions -> needs_tool=false, set reply.\n"
+        "- Needs an action covered by one of the available intents -> needs_tool=true, tool_name=that intent.\n"
+        "- Needs an action NOT covered by any available intent -> needs_tool=true and set tool_name to a "
+        "short proposed intent name (e.g. 'warrantyClaim', 'refundRequest') so it can be escalated.\n"
+        + struct_schema_hint(CheckResult)
+    )
+    messages = [SystemMessage(content=system), *state.messages]
     fallback = CheckResult(
         needs_tool=False,
         reply="I couldn't process that request. Could you please rephrase?",
@@ -888,6 +902,9 @@ def query_tool(state: AgentState) -> dict:
         "createOrder even if it is not the currently active flow.\n"
         "- Never invent tools: if `requested_tool` is not in the list above, ignore it and remap the "
         "request to the correct tool from the list.\n"
+        "- If the request needs an intent that NONE of the available tools supports, set "
+        "`proposed_new_tool` to the missing intent/tool name (e.g. 'warrantyClaim', 'refundRequest') "
+        "and leave `tool` as null. This triggers a human escalation and no tool is run.\n"
         "- Only choose escalateConversation if no other tool fits.\n"
         + struct_schema_hint(ToolChoice)
     )
@@ -908,6 +925,18 @@ def query_tool(state: AgentState) -> dict:
             }, ensure_ascii=False, default=str)),
         ],
     )
+    proposed = (choice.proposed_new_tool or "").strip()
+    if proposed or choice.tool is None or choice.tool == "escalateConversation":
+        intent = proposed or (choice.tool or "unsupported")
+        logger.warning("query_tool -> ESCALATE proposed_intent=%s", intent)
+        return {
+            "escalation": True,
+            "proposed_intent": intent,
+            "needs_tool": False,
+            "reply": "",
+            "tool_calls": [],
+            "tool_outputs": [f"ESCALATE: {intent}"],
+        }
     result = f"Selected tool: {choice.tool}. Args: {choice.arguments}"
     logger.info("query_tool -> %s", result)
     return {
@@ -1208,14 +1237,29 @@ def _store_config(config: RunnableConfig) -> tuple[tuple[str, str], str]:
     return ("assistant", str(store_key)), str(store_key)
 
 
+def _fresh_turn() -> dict[str, Any]:
+    return {
+        "escalation": False,
+        "proposed_intent": None,
+        "needs_tool": False,
+        "reply": "",
+        "flow_direction": "normal",
+        "flow_action": None,
+        "resolved_flow_id": None,
+        "tool_calls": [],
+        "tool_outputs": [],
+    }
+
+
 def hydrate(state: AgentState, *, store: BaseStore, config: RunnableConfig) -> dict:
+    resets = _fresh_turn()
     if state.conversation_memory.flows:
-        return {}
+        return resets
     ns, _ = _store_config(config)
     item = store.get(ns, "conversation_memory")
     if item is None:
-        return {}
-    return {"conversation_memory": ConversationMemory(**item.value)}
+        return resets
+    return {**resets, "conversation_memory": ConversationMemory(**item.value)}
 
 
 def persist(state: AgentState, *, store: BaseStore, config: RunnableConfig) -> dict:
@@ -1236,6 +1280,18 @@ def draft_route(state: AgentState) -> str:
     return {"continue": "extract_tool_args", "cancel": "reply"}.get(state.flow_direction, "check_llm")
 
 
+def query_escalate_route(state: AgentState) -> str:
+    return "escalate" if state.escalation else "flow_resolver"
+
+
+def escalate(state: AgentState) -> dict:
+    logger.warning(
+        "ESCALATION to human agent -> proposed_intent=%s",
+        state.proposed_intent,
+    )
+    return {"needs_tool": False, "reply": ""}
+
+
 def flow_route(state: AgentState) -> str:
     if state.flow_action in ("NO_FLOW_LOOKUP", "CLARIFY", "INVALID_ACTION"):
         return "reply"
@@ -1252,6 +1308,7 @@ graph.add_node("extract_tool_args", extract_tool_args)
 graph.add_node("ask_reply", ask_reply)
 graph.add_node("check_llm", check_llm)
 graph.add_node("query_tool", query_tool)
+graph.add_node("escalate", escalate)
 graph.add_node("flow_resolver", flow_resolver)
 graph.add_node("calling_tool", calling_tool)
 graph.add_node("reply", reply)
@@ -1271,7 +1328,12 @@ graph.add_conditional_edges(
 )
 graph.add_edge("ask_reply", "reply")
 graph.add_conditional_edges("check_llm", route, {"query_tool": "query_tool", "reply": "reply"})
-graph.add_edge("query_tool", "flow_resolver")
+graph.add_conditional_edges(
+    "query_tool",
+    query_escalate_route,
+    {"escalate": "escalate", "flow_resolver": "flow_resolver"},
+)
+graph.add_edge("escalate", "persist")
 graph.add_conditional_edges(
     "flow_resolver",
     flow_route,
