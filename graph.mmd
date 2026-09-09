@@ -6,6 +6,9 @@ config:
 graph TD;
 	__start__([<p>__start__</p>]):::first
 	hydrate(hydrate)
+	draft_gate(draft_gate)
+	extract_tool_args(extract_tool_args)
+	ask_reply(ask_reply)
 	check_llm(check_llm)
 	query_tool(query_tool)
 	flow_resolver(flow_resolver)
@@ -14,12 +17,19 @@ graph TD;
 	persist(persist)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> hydrate;
+	ask_reply --> reply;
 	calling_tool --> reply;
 	check_llm -.-> query_tool;
 	check_llm -.-> reply;
+	draft_gate -.-> check_llm;
+	draft_gate -.-> extract_tool_args;
+	draft_gate -.-> reply;
+	extract_tool_args -.-> ask_reply;
+	extract_tool_args -.-> calling_tool;
 	flow_resolver -.-> calling_tool;
+	flow_resolver -.-> extract_tool_args;
 	flow_resolver -.-> reply;
-	hydrate --> check_llm;
+	hydrate --> draft_gate;
 	query_tool --> flow_resolver;
 	reply --> persist;
 	persist --> __end__;

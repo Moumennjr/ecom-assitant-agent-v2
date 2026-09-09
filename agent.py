@@ -101,6 +101,14 @@ class ShippingContext(BaseModel):
     shipping_cost: float | None = None
 
 
+class ToolCallDraft(BaseModel):
+    tool_name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["drafting", "ready", "executed", "cancelled"] = "drafting"
+    attempts: int = 0
+    missing: list[str] = Field(default_factory=list)
+
+
 class Flow(BaseModel):
     flow_id: str
     state: FlowState
@@ -109,6 +117,7 @@ class Flow(BaseModel):
     product_discovery: ProductDiscoveryContext | None = None
     order: OrderContext | None = None
     shipping: ShippingContext | None = None
+    tool_draft: ToolCallDraft | None = None
 
 
 class GlobalInformation(BaseModel):
@@ -287,6 +296,7 @@ class AgentState(BaseModel):
     reply: str = ""
     conversation_memory: ConversationMemory = Field(default_factory=ConversationMemory)
     resolved_flow_id: str | None = None
+    flow_direction: str = "normal"
     flow_action: str | None = None
 
 
@@ -307,6 +317,10 @@ class FlowResolution(BaseModel):
     reason: str | None = Field(default=None, description="Reason for CLARIFY / INVALID_ACTION")
     product_name: str | None = Field(default=None, description="Product name for CREATE")
     filters: Filter | None = Field(default=None, description="Filters for CREATE")
+
+
+class DraftRoute(BaseModel):
+    decision: Literal["continue_draft", "new_request", "cancel"]
 
 
 def struct_schema_hint(schema: type[BaseModel]) -> str:
@@ -370,7 +384,7 @@ def _extract_json_span(text: str) -> str:
     return text[start:]
 
 
-def _parse_json_obj(text: str, schema: type[BaseModel]) -> BaseModel | None:
+def _parse_json_dict(text: str) -> dict[str, Any] | None:
     candidates = [text, _extract_json_span(text)]
     try:
         d = json.loads(text)
@@ -387,10 +401,22 @@ def _parse_json_obj(text: str, schema: type[BaseModel]) -> BaseModel | None:
             continue
         seen.add(cand)
         try:
-            return schema(**json.loads(cand))
-        except (json.JSONDecodeError, ValidationError, TypeError):
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
             continue
     return None
+
+
+def _parse_json_obj(text: str, schema: type[BaseModel]) -> BaseModel | None:
+    obj = _parse_json_dict(text)
+    if obj is None:
+        return None
+    try:
+        return schema(**obj)
+    except (ValidationError, TypeError):
+        return None
 
 
 def _call_json(model, schema: type[BaseModel], fallback: BaseModel, messages: list) -> BaseModel:
@@ -411,6 +437,106 @@ def _call_json(model, schema: type[BaseModel], fallback: BaseModel, messages: li
     return fallback
 
 
+# ============================================================
+# Tool schema introspection + argument draft helpers
+# ============================================================
+
+import re as _re
+
+_NUM_RE = _re.compile(r"\b\d+\b")
+_AFFIRM_RE = _re.compile(
+    r"\b(yes|yeah|yep|ok|okay|sure|fine|go|go ahead|do it|deal|let's go|lets go|nedi|ekhdem|zid|na'am|d'accord|aight)\b",
+    _re.IGNORECASE,
+)
+_CANCEL_RE = _re.compile(
+    r"\b(cancel|cancel it|forget|forget it|never mind|nevermind|nvm|stop|abort|leave it|drop it|"
+    r"asba|khaleh|la|no thanks|not now|later)\b",
+    _re.IGNORECASE,
+)
+
+_BUY_RE = _re.compile(
+    r"\b(buy|order|take|get|want|grab|nedi|khoud|ekhdem|prefer)\b",
+    _re.IGNORECASE,
+)
+
+_STOP_WORDS = {
+    "the", "this", "that", "your", "please", "actually", "will", "would", "could",
+    "with", "and", "for", "you", "i", "me", "just", "want",
+}
+
+_SCHEMA_CACHE: dict[str, tuple[list[str], dict[str, Any]]] = {}
+
+
+def tool_for(tool_name: str, flow: Flow | None = None):
+    if tool_name == "createOrder":
+        return _make_create_order_tool(flow)
+    return next((t for t in TOOLS if t.name == tool_name), None)
+
+
+def _tool_schema_info(tool_name: str) -> tuple[list[str], dict[str, Any]]:
+    if tool_name in _SCHEMA_CACHE:
+        return _SCHEMA_CACHE[tool_name]
+    required: list[str] = []
+    props: dict[str, Any] = {}
+    try:
+        tool = tool_for(tool_name)
+        schema = tool.args_schema.model_json_schema()
+        required = list(schema.get("required", []))
+        props = schema.get("properties", {})
+    except Exception as e:
+        logger.warning("Could not introspect schema for %s: %s", tool_name, e)
+    _SCHEMA_CACHE[tool_name] = (required, props)
+    return required, props
+
+
+def _coerce_args(raw: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    _, props = _tool_schema_info(tool_name)
+    out: dict[str, Any] = {}
+    for k, v in raw.items():
+        if k not in props or v is None or v == "":
+            continue
+        t = props[k].get("type")
+        try:
+            if t == "integer":
+                out[k] = int(float(v))
+            elif t == "number":
+                out[k] = float(v)
+            elif t == "boolean":
+                if isinstance(v, bool):
+                    out[k] = v
+                elif str(v).lower() in ("true", "1"):
+                    out[k] = True
+                elif str(v).lower() in ("false", "0"):
+                    out[k] = False
+                else:
+                    continue
+            else:
+                out[k] = str(v).strip()
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _field_missing(args: dict[str, Any], tool_name: str) -> list[str]:
+    required, _ = _tool_schema_info(tool_name)
+    return [f for f in required if args.get(f) is None or args.get(f) == ""]
+
+
+def _flow_draft(state: AgentState) -> tuple[Flow | None, ToolCallDraft | None]:
+    flow = _active_flow(state.conversation_memory, state.resolved_flow_id)
+    return flow, (flow.tool_draft if flow else None)
+
+
+def _llm_phrase(system: str, human: str) -> str:
+    try:
+        msg = model.invoke([SystemMessage(content=system), HumanMessage(content=human)])
+        text = _content_text(msg).strip()
+        return text or "Could you provide some more information, please?"
+    except Exception as e:
+        logger.warning("reply phrasing call failed (%s)", e)
+        return "Could you provide some more information, please?"
+
+
 def last_user_text(state: AgentState) -> str:
     for m in reversed(state.messages):
         if isinstance(m, str):
@@ -427,6 +553,149 @@ def last_user_text(state: AgentState) -> str:
 # ============================================================
 # Nodes
 # ============================================================
+
+def draft_gate(state: AgentState) -> dict:
+    direction = "normal"
+    _, draft = _flow_draft(state)
+    if draft is not None and draft.status == "drafting":
+        text = last_user_text(state)
+        low = text.lower()
+        if _CANCEL_RE.search(low):
+            direction = "cancel"
+        elif _NUM_RE.search(low) or _AFFIRM_RE.search(low):
+            direction = "continue"
+        else:
+            system = (
+                "A tool call is partially filled and we are waiting for missing arguments from the "
+                "customer. Decide whether the incoming customer message is:\n"
+                "- continue_draft: answering the pending question (providing one of the missing values, "
+                "or affirming it)\n"
+                "- cancel: abandoning/cancelling the pending step\n"
+                "- new_request: an unrelated or new request\n"
+                + struct_schema_hint(DraftRoute)
+            )
+            payload = json.dumps({
+                "pending_tool": draft.tool_name,
+                "missing_arguments": draft.missing,
+                "already_collected": draft.args,
+                "customer_message": text,
+            }, ensure_ascii=False, default=str)
+            dec = _call_json(
+                model,
+                DraftRoute,
+                DraftRoute(decision="new_request"),
+                [SystemMessage(content=system), HumanMessage(content=payload)],
+            )
+            direction = {
+                "continue_draft": "continue",
+                "cancel": "cancel",
+                "new_request": "normal",
+            }.get(dec.decision, "normal")
+    updates: dict[str, Any] = {"flow_direction": direction}
+    if direction == "cancel":
+        mem = state.conversation_memory.model_copy(deep=True)
+        flow = _active_flow(mem, state.resolved_flow_id)
+        if flow is not None:
+            flow.tool_draft = None
+            flow.updated_at = datetime.now(timezone.utc)
+        updates.update({
+            "conversation_memory": mem,
+            "needs_tool": False,
+            "reply": _llm_phrase(
+                "You are a helpful e-commerce assistant. Briefly and kindly confirm that you are "
+                "cancelling the step in progress. Match the customer's language.",
+                f"Cancelling step ({draft.tool_name}). Customer said: {text}",
+            ),
+        })
+    logger.info("draft_gate -> direction=%s draft=%s", direction, draft.tool_name if draft else None)
+    return updates
+
+
+def extract_tool_args(state: AgentState) -> dict:
+    mem = state.conversation_memory.model_copy(deep=True)
+    flow = _active_flow(mem, state.resolved_flow_id)
+    if flow is None or flow.tool_draft is None or flow.tool_draft.status != "drafting":
+        return {}
+    draft = flow.tool_draft
+    tool = tool_for(draft.tool_name, flow)
+    if tool is None:
+        return {}
+    selected = None
+    if flow.product_discovery is not None and flow.product_discovery.selected_product is not None:
+        selected = flow.product_discovery.selected_product.model_dump()
+    system = (
+        "You extract tool arguments from an e-commerce customer message. The target tool and its "
+        "schema are given. Output ONLY a JSON object with the fields you can confidently determine "
+        "from the customer message; leave every other field OUT. Do not invent values, do not repeat "
+        "the schema itself.\n"
+        + struct_schema_hint(tool.args_schema)
+    )
+    human = json.dumps({
+        "tool": draft.tool_name,
+        "already_collected": draft.args,
+        "missing_so_far": draft.missing,
+        "selected_product": selected,
+        "customer_message": last_user_text(state),
+    }, ensure_ascii=False, default=str)
+    extracted: dict[str, Any] = {}
+    try:
+        msg = model.invoke([SystemMessage(content=system), HumanMessage(content=human)])
+        raw = _parse_json_dict(_content_text(msg)) or {}
+        extracted = _coerce_args(raw, draft.tool_name)
+    except Exception as e:
+        logger.warning("extract_tool_args call failed (%s)", e)
+    before = dict(draft.args)
+    draft.args.update(extracted)
+    if _field_missing(before, draft.tool_name) == _field_missing(draft.args, draft.tool_name) and not extracted:
+        draft.attempts += 1
+    else:
+        draft.attempts = 0
+    draft.missing = _field_missing(draft.args, draft.tool_name)
+    if not draft.missing:
+        draft.status = "ready"
+    flow.updated_at = datetime.now(timezone.utc)
+    logger.info(
+        "extract_tool_args -> tool=%s extracted=%s missing=%s status=%s",
+        draft.tool_name, extracted, draft.missing, draft.status,
+    )
+    return {"conversation_memory": mem}
+
+
+def ask_reply(state: AgentState) -> dict:
+    flow, draft = _flow_draft(state)
+    if draft is None or flow is None:
+        return {}
+    required, props = _tool_schema_info(draft.tool_name)
+    missing = draft.missing or _field_missing(draft.args, draft.tool_name)
+    fields = [
+        f"{name}: {props.get(name, {}).get('description') or name}"
+        for name in missing
+    ]
+    selected = None
+    if flow.product_discovery is not None and flow.product_discovery.selected_product is not None:
+        selected = flow.product_discovery.selected_product.model_dump()
+    system = (
+        "You are a helpful e-commerce assistant completing a multi-step task. The customer must "
+        "provide a few missing pieces of information. Ask ONLY for those missing items, phrased "
+        "naturally and conversationally in the customer's language. Never ask about information we "
+        "already know, and never restate the full task."
+    )
+    human = json.dumps({
+        "task_tool": draft.tool_name,
+        "missing_items": fields,
+        "already_known": draft.args,
+        "selected_product": selected,
+        "customer_message": last_user_text(state),
+    }, ensure_ascii=False, default=str)
+    return {"needs_tool": False, "reply": _llm_phrase(system, human)}
+
+
+def after_extract(state: AgentState) -> str:
+    _, draft = _flow_draft(state)
+    if draft is not None and draft.status == "ready":
+        return "calling_tool"
+    return "ask_reply"
+
 
 def check_llm(state: AgentState) -> dict:
     messages = [SystemMessage(content=struct_schema_hint(CheckResult)), *state.messages]
@@ -461,12 +730,45 @@ def query_tool(state: AgentState) -> dict:
             "state": active.state.value if isinstance(active.state, FlowState) else active.state,
             "selected_product": selected,
         }
+    selected_flows = []
+    for f in state.conversation_memory.flows:
+        if f.product_discovery and f.product_discovery.selected_product is not None:
+            p = f.product_discovery.selected_product
+            selected_flows.append({
+                "flow_id": f.flow_id,
+                "state": f.state.value if isinstance(f.state, FlowState) else f.state,
+                "product_name": p.product_name,
+                "product_id": p.product_id,
+            })
+
+    low = user_text.lower()
+    tokens = set(t for t in _re.findall(r"[a-z]{3,}", low) if t not in _STOP_WORDS)
+    forced = None
+    if _BUY_RE.search(low):
+        for f in state.conversation_memory.flows:
+            if f.product_discovery and f.product_discovery.selected_product is not None:
+                p = f.product_discovery.selected_product
+                p_tokens = set(_re.findall(r"[a-z]{3,}", p.product_name.lower()))
+                if tokens & p_tokens:
+                    forced = p
+                    break
+    if forced is not None:
+        choice = ToolChoice(tool="createOrder", arguments={})
+        result = f"Selected tool: {choice.tool}. Args: {choice.arguments} (deterministic buy fast-path)"
+        logger.info("query_tool -> %s", result)
+        return {
+            "tool_outputs": [result],
+            "tool_calls": [{"name": choice.tool, "arguments": choice.arguments}],
+        }
+
     system = (
         "You pick the single best tool for the user's request. Available tools:\n"
         + "\n".join(f"- {name}: {desc}" for name, desc in TOOL_DESCRIPTIONS.items())
         + "\nRules:\n"
         "- When the user wants to BUY or ORDER a product that is already selected or visible in the "
         "conversation, choose createOrder and set quantity accordingly.\n"
+        "- If a product is selected in `flows_with_selected_product` and the user refers to it, choose "
+        "createOrder even if it is not the currently active flow.\n"
         "- Never invent tools: if `requested_tool` is not in the list above, ignore it and remap the "
         "request to the correct tool from the list.\n"
         "- Only choose escalateConversation if no other tool fits.\n"
@@ -484,6 +786,7 @@ def query_tool(state: AgentState) -> dict:
                 "requested_tool": call.get("name"),
                 "user_request": user_text,
                 "active_flow": flow_context,
+                "flows_with_selected_product": selected_flows,
             }, ensure_ascii=False, default=str)),
         ],
     )
@@ -540,9 +843,9 @@ def flow_resolver(state: AgentState) -> dict:
     )
 
     resolved_flow_id = state.resolved_flow_id
+    now = datetime.now(timezone.utc)
     if result.action == "CREATE":
         new_flow_id = uuid.uuid4().hex
-        now = datetime.now(timezone.utc)
         tool_name = state.tool_calls[0].get("name", "") if state.tool_calls else ""
         if tool_name in ("searchProducts", "recallPreviousProducts", "selectProduct", "getProductDetails", "suggestProducts"):
             flow_state = FlowState.PRODUCT_DISCOVERY
@@ -550,18 +853,30 @@ def flow_resolver(state: AgentState) -> dict:
         else:
             flow_state = FlowState.ORDER
             product_discovery = None
-        mem.flows.append(Flow(
+        new_flow = Flow(
             flow_id=new_flow_id,
             state=flow_state,
             created_at=now,
             updated_at=now,
             product_discovery=product_discovery,
-        ))
+        )
+        if tool_name:
+            new_flow.tool_draft = ToolCallDraft(tool_name=tool_name)
+        mem.flows.append(new_flow)
         mem.active_flow_id = new_flow_id
         resolved_flow_id = new_flow_id
     elif result.action == "CONTINUE":
         mem.active_flow_id = result.flow_id
         resolved_flow_id = result.flow_id
+        flow = _active_flow(mem, resolved_flow_id)
+        if flow is not None:
+            tool_name = state.tool_calls[0].get("name", "") if state.tool_calls else ""
+            if (
+                tool_name
+                and (flow.tool_draft is None or flow.tool_draft.status in ("executed", "cancelled") or flow.tool_draft.tool_name != tool_name)
+            ):
+                flow.tool_draft = ToolCallDraft(tool_name=tool_name)
+            flow.updated_at = now
     elif result.action in ("NO_FLOW_LOOKUP", "CLARIFY", "INVALID_ACTION"):
         resolved_flow_id = None
 
@@ -636,34 +951,64 @@ PRODUCT_RESULT_TOOLS = {"searchProducts", "getProductDetails", "recallPreviousPr
 
 
 def calling_tool(state: AgentState) -> dict:
-    user_text = last_user_text(state)
-    tool_context = state.tool_outputs[-1] if state.tool_outputs else "No tool selected."
     mem = state.conversation_memory.model_copy(deep=True)
     flow = _active_flow(mem, state.resolved_flow_id)
+    draft = flow.tool_draft if flow is not None else None
 
-    order_tool = _make_create_order_tool(flow)
-    tools = [order_tool] + [t for t in TOOLS if t.name != "createOrder"]
-    runtime_tool_node = ToolNode(tools)
-    runtime_tool_model = model.bind_tools(tools)
-
-    system = (
-        "You are an e-commerce assistant. Call the requested tool to fulfill the user's request."
-        f"\nResolved flow id: {state.resolved_flow_id or 'none'}. Tool context: {tool_context}"
-    )
-    ai_msg = runtime_tool_model.invoke([SystemMessage(content=system), HumanMessage(content=user_text)])
-    if getattr(ai_msg, "tool_calls", None):
-        tool_messages = runtime_tool_node.invoke([ai_msg])
-    else:
-        logger.warning("Tool model returned no tool call; skipping ToolNode")
-        tool_messages = [
-            ToolMessage(content="No tool was called by the assistant.", tool_call_id="no_tool_call")
-        ]
-
+    ai_msg: Any = None
+    tool_messages: list[Any] = []
     called_name = ""
     call_args: dict[str, Any] = {}
-    if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
-        called_name = ai_msg.tool_calls[0].get("name", "")
-        call_args = ai_msg.tool_calls[0].get("args") or {}
+
+    if draft is not None and draft.status == "ready":
+        tool = tool_for(draft.tool_name, flow)
+        if tool is None:
+            return {}
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[{
+                "name": tool.name,
+                "args": dict(draft.args),
+                "id": "draft-" + uuid.uuid4().hex[:8],
+                "type": "tool_call",
+            }],
+        )
+        try:
+            tool_messages = ToolNode([tool]).invoke([ai_msg])
+        except Exception as e:
+            logger.warning("draft tool execution failed (%s)", e)
+            tool_messages = [ToolMessage(
+                content=f"Tool execution failed: {e}", tool_call_id="draft-exec-error"
+            )]
+        called_name = tool.name
+        call_args = dict(draft.args)
+        flow.tool_draft = None
+        flow.updated_at = datetime.now(timezone.utc)
+        logger.info("calling_tool executed ready draft -> %s %s", called_name, call_args)
+    else:
+        user_text = last_user_text(state)
+        tool_context = state.tool_outputs[-1] if state.tool_outputs else "No tool selected."
+        order_tool = _make_create_order_tool(flow)
+        tools = [order_tool] + [t for t in TOOLS if t.name != "createOrder"]
+        runtime_tool_node = ToolNode(tools)
+        runtime_tool_model = model.bind_tools(tools)
+
+        system = (
+            "You are an e-commerce assistant. Call the requested tool to fulfill the user's request."
+            f"\nResolved flow id: {state.resolved_flow_id or 'none'}. Tool context: {tool_context}"
+        )
+        ai_msg = runtime_tool_model.invoke([SystemMessage(content=system), HumanMessage(content=user_text)])
+        if getattr(ai_msg, "tool_calls", None):
+            tool_messages = runtime_tool_node.invoke([ai_msg])
+        else:
+            logger.warning("Tool model returned no tool call; skipping ToolNode")
+            tool_messages = [
+                ToolMessage(content="No tool was called by the assistant.", tool_call_id="no_tool_call")
+            ]
+        if hasattr(ai_msg, "tool_calls") and ai_msg.tool_calls:
+            called_name = ai_msg.tool_calls[0].get("name", "")
+            call_args = ai_msg.tool_calls[0].get("args") or {}
+
     if called_name in PRODUCT_RESULT_TOOLS and tool_messages:
         prods = _tool_result_products(getattr(tool_messages[0], "content", ""))
         if prods and flow is not None:
@@ -685,6 +1030,7 @@ def calling_tool(state: AgentState) -> dict:
         "messages": [ai_msg, *tool_messages],
         "tool_outputs": [getattr(m, "content", str(m)) for m in tool_messages],
         "conversation_memory": mem,
+        "needs_tool": True,
     }
 
 
@@ -745,14 +1091,24 @@ def route(state: AgentState) -> str:
     return "query_tool" if state.needs_tool else "reply"
 
 
+def draft_route(state: AgentState) -> str:
+    return {"continue": "extract_tool_args", "cancel": "reply"}.get(state.flow_direction, "check_llm")
+
+
 def flow_route(state: AgentState) -> str:
     if state.flow_action in ("NO_FLOW_LOOKUP", "CLARIFY", "INVALID_ACTION"):
         return "reply"
+    _, draft = _flow_draft(state)
+    if draft is not None and draft.status == "drafting":
+        return "extract_tool_args"
     return "calling_tool"
 
 
 graph = StateGraph(AgentState)
 graph.add_node("hydrate", hydrate)
+graph.add_node("draft_gate", draft_gate)
+graph.add_node("extract_tool_args", extract_tool_args)
+graph.add_node("ask_reply", ask_reply)
 graph.add_node("check_llm", check_llm)
 graph.add_node("query_tool", query_tool)
 graph.add_node("flow_resolver", flow_resolver)
@@ -761,10 +1117,25 @@ graph.add_node("reply", reply)
 graph.add_node("persist", persist)
 
 graph.add_edge(START, "hydrate")
-graph.add_edge("hydrate", "check_llm")
+graph.add_edge("hydrate", "draft_gate")
+graph.add_conditional_edges(
+    "draft_gate",
+    draft_route,
+    {"extract_tool_args": "extract_tool_args", "reply": "reply", "check_llm": "check_llm"},
+)
+graph.add_conditional_edges(
+    "extract_tool_args",
+    after_extract,
+    {"calling_tool": "calling_tool", "ask_reply": "ask_reply"},
+)
+graph.add_edge("ask_reply", "reply")
 graph.add_conditional_edges("check_llm", route, {"query_tool": "query_tool", "reply": "reply"})
 graph.add_edge("query_tool", "flow_resolver")
-graph.add_conditional_edges("flow_resolver", flow_route, {"calling_tool": "calling_tool", "reply": "reply"})
+graph.add_conditional_edges(
+    "flow_resolver",
+    flow_route,
+    {"calling_tool": "calling_tool", "reply": "reply", "extract_tool_args": "extract_tool_args"},
+)
 graph.add_edge("calling_tool", "reply")
 graph.add_edge("reply", "persist")
 graph.add_edge("persist", END)
@@ -796,10 +1167,16 @@ def save_graph_png(path: str = "graph.png") -> str:
         return path
     except Exception as e:
         logger.warning("PNG render failed (%s); falling back to mermaid source", e)
-        with open("graph.mmd", "w") as f:
-            f.write(app.get_graph().draw_mermaid())
-        print(app.get_graph().draw_ascii())
-        logger.info("Saved mermaid source to graph.mmd")
+        try:
+            with open("graph.mmd", "w") as f:
+                f.write(app.get_graph().draw_mermaid())
+            logger.info("Saved mermaid source to graph.mmd")
+        except Exception as e2:
+            logger.warning("mermaid source write failed (%s)", e2)
+        try:
+            print(app.get_graph().draw_ascii())
+        except Exception as e3:
+            logger.warning("ascii render unavailable (%s)", e3)
         return "graph.mmd"
 
 
