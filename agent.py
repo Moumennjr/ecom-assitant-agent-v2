@@ -550,6 +550,38 @@ def last_user_text(state: AgentState) -> str:
     return ""
 
 
+def _recent_transcript(state: AgentState, n: int = 6) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for m in reversed(state.messages):
+        if len(items) >= n:
+            break
+        if isinstance(m, dict):
+            role = str(m.get("role", "?"))
+            text = m.get("content", "")
+        else:
+            mtype = getattr(m, "type", "")
+            if mtype == "human":
+                role = "customer"
+            elif mtype == "ai":
+                role = "assistant"
+            elif mtype == "tool":
+                role = "tool"
+            else:
+                role = mtype or "?"
+            text = getattr(m, "content", "") or ""
+        if isinstance(text, list):
+            parts = []
+            for c in text:
+                if isinstance(c, dict):
+                    parts.append(c.get("text", "") if c.get("type") == "text" else json.dumps(c))
+                else:
+                    parts.append(str(c))
+            text = " ".join(parts)
+        items.append({"role": role, "text": str(text)[:300]})
+    items.reverse()
+    return items
+
+
 # ============================================================
 # Nodes
 # ============================================================
@@ -765,6 +797,9 @@ def query_tool(state: AgentState) -> dict:
         "You pick the single best tool for the user's request. Available tools:\n"
         + "\n".join(f"- {name}: {desc}" for name, desc in TOOL_DESCRIPTIONS.items())
         + "\nRules:\n"
+        "- Read `recent_conversation` before deciding. The user's latest message often answers an "
+        "earlier question or continues an earlier subject - use that history to infer the true intent "
+        "of the latest message.\n"
         "- When the user wants to BUY or ORDER a product that is already selected or visible in the "
         "conversation, choose createOrder and set quantity accordingly.\n"
         "- If a product is selected in `flows_with_selected_product` and the user refers to it, choose "
@@ -787,6 +822,7 @@ def query_tool(state: AgentState) -> dict:
                 "user_request": user_text,
                 "active_flow": flow_context,
                 "flows_with_selected_product": selected_flows,
+                "recent_conversation": _recent_transcript(state),
             }, ensure_ascii=False, default=str)),
         ],
     )
