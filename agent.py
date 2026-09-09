@@ -13,7 +13,6 @@ from langgraph.prebuilt import ToolNode
 from langgraph.store.memory import InMemoryStore
 from langgraph.store.base import BaseStore
 from langchain_core.runnables import RunnableConfig
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -24,18 +23,17 @@ from langchain_core.messages import (
 from rich import print
 from langchain_core.tools import tool
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from langchain_groq import ChatGroq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-logging.getLogger("google.genai").setLevel(logging.WARNING)
 
 load_dotenv()
-api_key = os.getenv("GOOGLE_API_KEY")
 
-model = ChatGoogleGenerativeAI(
-    model="gemini-3.5-flash",
-    google_api_key=api_key,
+model = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0,
 )
 
 def messages_reducer(left: list[Any], right: list[Any]) -> list[Any]:
@@ -311,9 +309,106 @@ class FlowResolution(BaseModel):
     filters: Filter | None = Field(default=None, description="Filters for CREATE")
 
 
-structured_model = model.with_structured_output(CheckResult)
-tool_picker = model.with_structured_output(ToolChoice)
-flow_resolver_model = model.with_structured_output(FlowResolution)
+def struct_schema_hint(schema: type[BaseModel]) -> str:
+    return (
+        "Respond with a single valid JSON object ONLY, with no prose, markdown, or extra text. "
+        "Never use an OpenAI function call format (do not wrap the object in {\"name\": ..., "
+        "\"arguments\": ...}). Output the raw JSON object directly.\n"
+        "The JSON must conform exactly to this JSON schema:\n"
+        + json.dumps(schema.model_json_schema())
+    )
+
+
+def _content_text(raw: Any) -> str:
+    content = getattr(raw, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                parts.append(c.get("text", "") if c.get("type") == "text" else json.dumps(c))
+            else:
+                parts.append(str(c))
+        return "".join(parts)
+    return str(content or "")
+
+
+def _extract_json_span(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return text[start:]
+
+
+def _parse_json_obj(text: str, schema: type[BaseModel]) -> BaseModel | None:
+    candidates = [text, _extract_json_span(text)]
+    try:
+        d = json.loads(text)
+        if isinstance(d, dict) and "name" in d and "arguments" in d:
+            args = d["arguments"]
+            if isinstance(args, str):
+                args = json.loads(args)
+            candidates.append(json.dumps(args))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    seen: set[str] = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            return schema(**json.loads(cand))
+        except (json.JSONDecodeError, ValidationError, TypeError):
+            continue
+    return None
+
+
+def _call_json(model, schema: type[BaseModel], fallback: BaseModel, messages: list) -> BaseModel:
+    retry_msg = HumanMessage(
+        content="That was not valid JSON output. Reply with ONLY the raw JSON object matching the "
+        "schema, with no prose and no name/arguments wrapper."
+    )
+    for messages_ in (messages, [*messages, retry_msg]):
+        try:
+            raw = model.invoke(messages_)
+        except Exception as e:
+            logger.warning("structured call failed (%s)", e)
+            continue
+        parsed = _parse_json_obj(_content_text(raw), schema)
+        if parsed is not None:
+            return parsed
+        logger.warning("structured response did not parse: %s", _content_text(raw)[:200])
+    return fallback
 
 
 def last_user_text(state: AgentState) -> str:
@@ -334,7 +429,12 @@ def last_user_text(state: AgentState) -> str:
 # ============================================================
 
 def check_llm(state: AgentState) -> dict:
-    result = structured_model.invoke(state.messages)
+    messages = [SystemMessage(content=struct_schema_hint(CheckResult)), *state.messages]
+    fallback = CheckResult(
+        needs_tool=False,
+        reply="I couldn't process that request. Could you please rephrase?",
+    )
+    result = _call_json(model, CheckResult, fallback, messages)
     return {
         "tool_calls": [{"name": result.tool_name}] if (result.needs_tool and result.tool_name) else [],
         "needs_tool": result.needs_tool,
@@ -369,19 +469,30 @@ def query_tool(state: AgentState) -> dict:
         "conversation, choose createOrder and set quantity accordingly.\n"
         "- Never invent tools: if `requested_tool` is not in the list above, ignore it and remap the "
         "request to the correct tool from the list.\n"
-        "- Only choose escalateConversation if no other tool fits."
+        "- Only choose escalateConversation if no other tool fits.\n"
+        + struct_schema_hint(ToolChoice)
     )
-    choice = tool_picker.invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=json.dumps({
-            "requested_tool": call.get("name"),
-            "user_request": user_text,
-            "active_flow": flow_context,
-        }, ensure_ascii=False, default=str)),
-    ])
+    fallback_name = call.get("name") if call.get("name") in TOOL_NAMES else "searchProducts"
+    fallback = ToolChoice(tool=fallback_name, arguments={})
+    choice = _call_json(
+        model,
+        ToolChoice,
+        fallback,
+        [
+            SystemMessage(content=system),
+            HumanMessage(content=json.dumps({
+                "requested_tool": call.get("name"),
+                "user_request": user_text,
+                "active_flow": flow_context,
+            }, ensure_ascii=False, default=str)),
+        ],
+    )
     result = f"Selected tool: {choice.tool}. Args: {choice.arguments}"
     logger.info("query_tool -> %s", result)
-    return {"tool_outputs": [result]}
+    return {
+        "tool_outputs": [result],
+        "tool_calls": [{"name": choice.tool, "arguments": choice.arguments}],
+    }
 
 
 def flow_resolver(state: AgentState) -> dict:
@@ -414,12 +525,19 @@ def flow_resolver(state: AgentState) -> dict:
         "Never return INVALID_ACTION for a buy/order request.\n"
         "- escalateConversation applies only when the matter is truly out of scope; return "
         "INVALID_ACTION with a reason.\n"
-        "- If it is ambiguous which flow applies, return CLARIFY with a reason."
+        "- If it is ambiguous which flow applies, return CLARIFY with a reason.\n"
+        + struct_schema_hint(FlowResolution)
     )
-    result = flow_resolver_model.invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=json.dumps(context, default=str)),
-    ])
+    fallback = FlowResolution(action="CLARIFY", reason="Unable to resolve the flow automatically.")
+    result = _call_json(
+        model,
+        FlowResolution,
+        fallback,
+        [
+            SystemMessage(content=system),
+            HumanMessage(content=json.dumps(context, default=str)),
+        ],
+    )
 
     resolved_flow_id = state.resolved_flow_id
     if result.action == "CREATE":
@@ -487,6 +605,7 @@ def _make_create_order_tool(flow: Flow | None):
             "product_id": product.product_id,
             "product_name": product.product_name,
             "price": product.price,
+            "currency": "DZD",
             "quantity": quantity,
             "status": "order_created",
         }, ensure_ascii=False)
@@ -532,7 +651,13 @@ def calling_tool(state: AgentState) -> dict:
         f"\nResolved flow id: {state.resolved_flow_id or 'none'}. Tool context: {tool_context}"
     )
     ai_msg = runtime_tool_model.invoke([SystemMessage(content=system), HumanMessage(content=user_text)])
-    tool_messages = runtime_tool_node.invoke([ai_msg])
+    if getattr(ai_msg, "tool_calls", None):
+        tool_messages = runtime_tool_node.invoke([ai_msg])
+    else:
+        logger.warning("Tool model returned no tool call; skipping ToolNode")
+        tool_messages = [
+            ToolMessage(content="No tool was called by the assistant.", tool_call_id="no_tool_call")
+        ]
 
     called_name = ""
     call_args: dict[str, Any] = {}
@@ -575,7 +700,9 @@ def reply(state: AgentState) -> dict:
                     "You are a helpful e-commerce assistant. Answer the user's request based only on "
                     "the tool result provided. When the result lists products, present them as a short "
                     "bulleted list with name and price in the given currency, and note stock availability "
-                    "if relevant. If the result says no products were found, acknowledge that politely."
+                    "if relevant. If the result says no products were found, acknowledge that politely. "
+                    "Always use the exact currency code from the tool result (DZD for orders); never "
+                    "invent or substitute a currency symbol."
                 )
             ),
             HumanMessage(content=f"Tool result:\n{tool_result}\n\nUser request: {user_text}"),
