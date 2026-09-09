@@ -104,6 +104,7 @@ class ShippingContext(BaseModel):
 class ToolCallDraft(BaseModel):
     tool_name: str
     args: dict[str, Any] = Field(default_factory=dict)
+    prereqs: dict[str, Any] = Field(default_factory=dict)
     status: Literal["drafting", "ready", "executed", "cancelled"] = "drafting"
     attempts: int = 0
     missing: list[str] = Field(default_factory=list)
@@ -124,6 +125,7 @@ class GlobalInformation(BaseModel):
     customer_name: str | None = None
     wilaya: str | None = None
     commune: str | None = None
+    address: str | None = None
 
 
 class ConversationMemory(BaseModel):
@@ -309,6 +311,12 @@ class CheckResult(BaseModel):
 class ToolChoice(BaseModel):
     tool: Literal[*TOOL_NAMES] = Field(description="The tool to use for the user's request")
     arguments: dict[str, Any] = Field(default_factory=dict, description="Arguments for the tool")
+
+
+class AddressFields(BaseModel):
+    wilaya: str | None = Field(default=None, description="The wilaya (province) mentioned in the customer message.")
+    commune: str | None = Field(default=None, description="The commune (city/town) mentioned in the customer message.")
+    address: str | None = Field(default=None, description="The street or detailed delivery address mentioned in the customer message.")
 
 
 class FlowResolution(BaseModel):
@@ -522,6 +530,28 @@ def _field_missing(args: dict[str, Any], tool_name: str) -> list[str]:
     return [f for f in required if args.get(f) is None or args.get(f) == ""]
 
 
+ADDRESS_FIELD_DESCS = {
+    "wilaya": "the wilaya (province) to ship to",
+    "commune": "the commune (city/town) to ship to",
+    "address": "the street or detailed delivery address",
+}
+
+
+def _prereqs_for(tool_name: str, mem: ConversationMemory) -> dict[str, Any]:
+    if tool_name != "createOrder":
+        return {}
+    gi = mem.global_information
+    prereqs: dict[str, Any] = {}
+    for f in ADDRESS_FIELD_DESCS:
+        if not getattr(gi, f, None):
+            prereqs[f] = None
+    return prereqs
+
+
+def _missing_prereqs(prereqs: dict[str, Any]) -> list[str]:
+    return [k for k, v in prereqs.items() if v is None or v == ""]
+
+
 def _flow_draft(state: AgentState) -> tuple[Flow | None, ToolCallDraft | None]:
     flow = _active_flow(state.conversation_memory, state.resolved_flow_id)
     return flow, (flow.tool_draft if flow else None)
@@ -676,19 +706,66 @@ def extract_tool_args(state: AgentState) -> dict:
         extracted = _coerce_args(raw, draft.tool_name)
     except Exception as e:
         logger.warning("extract_tool_args call failed (%s)", e)
-    before = dict(draft.args)
+    before_args_missing = _field_missing(draft.args, draft.tool_name)
+    before_prereq_missing = _missing_prereqs(_prereqs_for(draft.tool_name, mem))
     draft.args.update(extracted)
-    if _field_missing(before, draft.tool_name) == _field_missing(draft.args, draft.tool_name) and not extracted:
-        draft.attempts += 1
-    else:
+
+    prereq_missing = _missing_prereqs(_prereqs_for(draft.tool_name, mem))
+    if prereq_missing:
+        addr_system = (
+            "You extract a shipping address from an e-commerce customer message. Output ONLY a JSON "
+            "object with the fields you can confidently determine; leave every other field OUT. Do "
+            "not invent values, do not repeat the schema itself.\n"
+            + struct_schema_hint(AddressFields)
+        )
+        addr_human = json.dumps({
+            "customer_message": last_user_text(state),
+            "already_known": {f: getattr(mem.global_information, f, None) for f in ADDRESS_FIELD_DESCS},
+        }, ensure_ascii=False, default=str)
+        addr_raw: dict[str, Any] = {}
+        try:
+            msg = model.invoke([SystemMessage(content=addr_system), HumanMessage(content=addr_human)])
+            addr_raw = _parse_json_dict(_content_text(msg)) or {}
+        except Exception as e:
+            logger.warning("address extraction call failed (%s)", e)
+        for k in prereq_missing:
+            v = addr_raw.get(k)
+            if isinstance(v, (list, dict)):
+                v = json.dumps(v)
+            if v is not None and str(v).strip():
+                draft.prereqs[k] = str(v).strip()
+            else:
+                draft.prereqs.setdefault(k, None)
+        gi = mem.global_information
+        if any(draft.prereqs.get(k) for k in ADDRESS_FIELD_DESCS):
+            for k in ADDRESS_FIELD_DESCS:
+                if draft.prereqs.get(k):
+                    setattr(gi, k, str(draft.prereqs[k]).strip())
+            flow.shipping = ShippingContext(
+                wilaya=gi.wilaya,
+                commune=gi.commune,
+                address=gi.address,
+                shipping_cost=flow.shipping.shipping_cost if flow.shipping else None,
+            )
+            logger.info("global address updated -> wilaya=%s commune=%s address=%s", gi.wilaya, gi.commune, gi.address)
+
+    missing_args = _field_missing(draft.args, draft.tool_name)
+    missing_prereqs = _missing_prereqs(_prereqs_for(draft.tool_name, mem))
+    if (
+        missing_args != before_args_missing
+        or missing_prereqs != before_prereq_missing
+        or extracted
+    ):
         draft.attempts = 0
-    draft.missing = _field_missing(draft.args, draft.tool_name)
+    else:
+        draft.attempts += 1
+    draft.missing = missing_args + missing_prereqs
     if not draft.missing:
         draft.status = "ready"
     flow.updated_at = datetime.now(timezone.utc)
     logger.info(
-        "extract_tool_args -> tool=%s extracted=%s missing=%s status=%s",
-        draft.tool_name, extracted, draft.missing, draft.status,
+        "extract_tool_args -> tool=%s extracted=%s prereqs=%s missing=%s status=%s attempts=%s",
+        draft.tool_name, extracted, draft.prereqs, draft.missing, draft.status, draft.attempts,
     )
     return {"conversation_memory": mem}
 
@@ -702,7 +779,11 @@ def ask_reply(state: AgentState) -> dict:
     fields = [
         f"{name}: {props.get(name, {}).get('description') or name}"
         for name in missing
+        if name in props
     ]
+    known_gi = state.conversation_memory.global_information
+    prereq_missing = _missing_prereqs(_prereqs_for(draft.tool_name, state.conversation_memory))
+    fields.extend(f"{name}: {desc}" for name, desc in ADDRESS_FIELD_DESCS.items() if name in prereq_missing)
     selected = None
     if flow.product_discovery is not None and flow.product_discovery.selected_product is not None:
         selected = flow.product_discovery.selected_product.model_dump()
@@ -716,6 +797,7 @@ def ask_reply(state: AgentState) -> dict:
         "task_tool": draft.tool_name,
         "missing_items": fields,
         "already_known": draft.args,
+        "known_address": {f: getattr(known_gi, f, None) for f in ADDRESS_FIELD_DESCS},
         "selected_product": selected,
         "customer_message": last_user_text(state),
     }, ensure_ascii=False, default=str)
@@ -951,7 +1033,8 @@ def _make_create_order_tool(flow: Flow | None):
                 f"No product selected in flow {flow.flow_id if flow else 'none'} to order. "
                 "Run a product search first so the product is attached to the active flow."
             )
-        return json.dumps({
+        shipping = flow.shipping if flow is not None else None
+        payload: dict[str, Any] = {
             "tool": "createOrder",
             "product_id": product.product_id,
             "product_name": product.product_name,
@@ -959,7 +1042,14 @@ def _make_create_order_tool(flow: Flow | None):
             "currency": "DZD",
             "quantity": quantity,
             "status": "order_created",
-        }, ensure_ascii=False)
+        }
+        if shipping and (shipping.wilaya or shipping.commune or shipping.address):
+            payload["shipping"] = shipping.model_dump()
+        else:
+            payload["shipping"] = None
+            payload["status"] = "order_pending_address"
+            payload["message"] = "Please provide your shipping address (wilaya and commune) so we can finalize the order."
+        return json.dumps(payload, ensure_ascii=False)
     return createOrder
 
 
@@ -995,6 +1085,21 @@ def calling_tool(state: AgentState) -> dict:
     tool_messages: list[Any] = []
     called_name = ""
     call_args: dict[str, Any] = {}
+
+    if flow is not None:
+        gi = mem.global_information
+        if (gi.wilaya or gi.commune or gi.address) and (
+            flow.shipping is None
+            or flow.shipping.wilaya != gi.wilaya
+            or flow.shipping.commune != gi.commune
+            or flow.shipping.address != gi.address
+        ):
+            flow.shipping = ShippingContext(
+                wilaya=gi.wilaya,
+                commune=gi.commune,
+                address=gi.address,
+                shipping_cost=flow.shipping.shipping_cost if flow.shipping else None,
+            )
 
     if draft is not None and draft.status == "ready":
         tool = tool_for(draft.tool_name, flow)
